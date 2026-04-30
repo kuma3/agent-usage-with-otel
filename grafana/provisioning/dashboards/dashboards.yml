@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Codex OTel
+    orgId: 1
+    folder: Codex OTel
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
