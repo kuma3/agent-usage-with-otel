@@ -339,6 +339,251 @@ OTelの属性名 `service.name` は、LokiやPrometheusでは `service_name` の
 
 Dockerコンテナ同士の通信では `otel-collector:4318` のようなサービス名を使えますが、ホストで動くCodexからは `localhost` が正解です。
 
+## もう少し深い理解メモ
+
+ここからは、このデモを触りながら理解したOTelまわりの補足です。最初は読み飛ばしても大丈夫ですが、Grafanaで実際のデータを見始めると効いてきます。
+
+**OTLPの `/v1/logs` と `/v1/metrics` は標準パス**
+
+Codex起動時には、logsとmetricsの送信先をこう指定しています。
+
+```sh
+-c 'otel.exporter={ otlp-http = { endpoint = "http://localhost:4318/v1/logs", protocol = "binary" } }'
+-c 'otel.metrics_exporter={ otlp-http = { endpoint = "http://localhost:4318/v1/metrics", protocol = "binary" } }'
+```
+
+`/v1/logs` や `/v1/metrics` はこのリポジトリ独自のパスではなく、OTLP/HTTPの標準パスです。Collector側では `4318` でOTLP/HTTP receiverを立てているだけです。
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+```
+
+OTLP/HTTPでは、signalごとに標準パスが分かれます。
+
+```text
+POST /v1/logs
+POST /v1/metrics
+POST /v1/traces
+```
+
+**Collectorの `exporter` は出口**
+
+Collector設定には、`receivers`, `processors`, `exporters`, `service` が出てきます。
+
+```text
+receiver  = 入り口
+processor = 加工
+exporter  = 出口
+service   = 部品をどう配線して動かすか
+```
+
+今回のexporter定義はこうです。
+
+```yaml
+exporters:
+  debug:
+    verbosity: normal
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+  prometheus:
+    endpoint: 0.0.0.0:9464
+```
+
+`debug`, `otlp_http`, `prometheus` はCollectorが知っているexporter typeです。`otlp_http/loki` の `/loki` は任意のインスタンス名で、「Loki向けに使っているotlp_http exporter」と区別するための名前です。
+
+ただし、exporterを定義しただけでは使われません。どのsignalをどのexporterへ流すかは `service.pipelines` で決まります。
+
+```yaml
+service:
+  pipelines:
+    logs:
+      exporters: [otlp_http/loki, debug]
+    metrics:
+      exporters: [prometheus, debug]
+```
+
+つまり「ログはLokiへ、メトリクスはPrometheusへ」は `service.pipelines` が持っている配線です。
+
+**Codexのevent名はログ本文ではなくstructured metadataに出る**
+
+Codexのドキュメントには、`codex.tool_decision` や `codex.tool_result` のようなイベント名が出てきます。これは「Lokiのログ本文にその文字列が表示される」という意味ではなく、OTel LogRecordの属性としてイベント名が入る、という意味です。
+
+Loki/Grafanaでは、ログ本文が空に見えることがあります。その場合でも、行を展開するとStructured metadataに次のような値が入っています。
+
+```text
+event_name = codex.tool_decision
+decision = approved
+event_timestamp = ...
+duration_ms = ...
+success = true
+```
+
+Grafana Exploreでは、本文検索よりもmetadata filterを使うと探しやすいです。
+
+```logql
+{service_name="codex-local-demo"} | event_name="codex.tool_decision"
+```
+
+tool系をまとめて見るなら:
+
+```logql
+{service_name="codex-local-demo"} | event_name=~"codex\\.tool_.*"
+```
+
+ログ一覧で見やすくしたい場合は `line_format` を使います。
+
+```logql
+{service_name="codex-local-demo"}
+| event_name=~"codex\\.tool_(decision|result)"
+| line_format "{{.event_timestamp}} {{.event_name}} tool={{.tool_name}} decision={{.decision}} success={{.success}} duration={{.duration_ms}}ms"
+```
+
+**labelsとstructured metadataは違う**
+
+Lokiにはlabelsとstructured metadataがあります。
+
+```text
+labels
+  インデックスされる検索キー。少数に絞る。
+  例: service_name, deployment_environment
+
+structured metadata
+  各ログ行に付く構造化フィールド。
+  例: event_name, model, duration_ms, success, decision
+```
+
+今回のLokiでは、`service_name` と `deployment_environment` がlabelsとして見え、`event_name` や `decision` などはstructured metadataとして見えます。
+
+**LogRecord、Semantic Conventions、Codex独自スキーマは別レイヤー**
+
+OTelのLogRecordは「1件のログ/イベントの標準的な入れ物」です。大まかには次のような枠を持ちます。
+
+```text
+Timestamp
+SeverityText / SeverityNumber
+Body
+Resource
+Attributes
+TraceId / SpanId
+```
+
+Semantic Conventionsは「共通の意味を持つ属性は、この名前で入れよう」という標準辞書です。
+
+```text
+service.name
+service.version
+host.name
+telemetry.sdk.language
+exception.type
+log.file.name
+```
+
+一方、Codex固有のイベント名や属性はCodex独自スキーマです。
+
+```text
+event_name = codex.tool_decision
+decision = approved
+tool_name = ...
+conversation_id = ...
+```
+
+つまり:
+
+```text
+OTelデータモデル
+  ログやメトリクスの箱の形
+
+Semantic Conventions
+  共通概念の標準的な属性名
+
+Codex独自スキーマ
+  Codexがemitする固有イベントや固有属性
+```
+
+**属性を入れるかどうかは、作る側や収集する側が決める**
+
+たとえばLog Semantic Conventionsに `log.file.name` があります。これは「ログがファイル由来なら、そのファイル名をこの属性名で入れよう」という約束です。
+
+ただし、OTelが勝手に `log.file.name` を入れるわけではありません。実際に属性を入れるのは、そのLogRecordを作る側です。
+
+```text
+アプリが直接OTelをemitする場合
+  アプリやSDKが属性を決める
+
+Collectorのfilelog receiverがファイルを読む場合
+  receiver/operatorが log.file.name などを付ける
+
+HTTP自動計装の場合
+  instrumentation libraryが http.request.method などを付ける
+
+Collector processorで補う場合
+  設定で service.name などを追加する
+```
+
+今回こちらで明示的に足しているのは、Collector processorのこの部分です。
+
+```yaml
+processors:
+  resource/codex_demo:
+    attributes:
+      - key: service.name
+        value: codex-local-demo
+        action: upsert
+      - key: deployment.environment
+        value: local
+        action: upsert
+```
+
+**Skill注入はPrometheus metricで見る**
+
+Codexのskillは、必要だと判断されるとモデルに渡すコンテキストへ入ります。これを「skillが注入される」と考えるとわかりやすいです。
+
+```text
+Skill injected
+  = そのskillの説明や指示がモデル入力に入った
+  = ただし、モデルが実際に従った証明ではない
+```
+
+Codexはskill注入をログではなくメトリクスとしてemitします。Prometheusでは次のmetricで見えます。
+
+```promql
+codex_skill_injected_total
+```
+
+特定skillを見るなら:
+
+```promql
+codex_skill_injected_total{skill="baseline-ui"}
+```
+
+直近30分でskill別に集計するなら:
+
+```promql
+sum by (skill, status, invoke_type) (
+  increase(codex_skill_injected_total[30m])
+)
+```
+
+このmetricでわかるのは「そのskillがモデル入力に入った」ことです。一方で、「モデルがそのskillの指示に実際に従ったか」までは直接証明できません。そこを見るには、tool call、出力形式、レビュー結果など別の観測可能な契約が必要になります。
+
+ログとメトリクスの境界は、少し直感に反することがあります。たとえば「skillが注入された」は出来事なのでログっぽく感じますが、Codexでは「どのskillが何回注入されたか」を集計しやすいcounter metricとして扱っています。
+
+```text
+codex.tool_decision
+  1件ごとの詳細を追いたい
+  -> LogRecord
+  -> Loki
+
+skill.injected
+  回数や傾向を集計したい
+  -> Metric counter
+  -> Prometheus
+```
+
 ## ファイルごとの役割
 
 `docker-compose.yml`
